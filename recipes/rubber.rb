@@ -7,6 +7,7 @@ require 'enumerator'
 require 'rubber/util'
 require 'rubber/configuration'
 require 'capistrano/hostcmd'
+require 'pp'
 
 require 'rubygems'
 require 'EC2'
@@ -23,6 +24,11 @@ namespace :rubber do
       alias :required_task :task
       def task(name, options={}, &block)
         required_task(name, options) do
+          # define empty roles for the case when a task has a role that we don't define anywhere
+          [*options[:roles]].each do |r|
+            roles[r] ||= []
+          end
+          
           if find_servers_for_task(current_task).empty?
             logger.info "No servers for task #{name}, skipping"
             next
@@ -291,6 +297,7 @@ namespace :rubber do
     env = rubber_cfg.environment.bind()
     return unless groups
     
+    groups = Rubber::Util::stringify(groups)
     group_keys = groups.keys.clone()
     ec2 = EC2::Base.new(:access_key_id => env.aws_access_key, :secret_access_key => env.aws_secret_access_key)
     
@@ -302,29 +309,40 @@ namespace :rubber do
         logger.debug "Security Group already in ec2, syncing rules: #{item.groupName}"
         group = groups[item.groupName]
         rules = group['rules'].clone
+        rule_maps = []
+        
+        # first collect the rule maps from the request (group/user pairs are duplicated for tcp/udp/icmp, 
+        # so we need to do this up frnot and remove duplicates before checking against the local rubber rules)
         item.ipPermissions.item.each do |rule|
-          rule_maps = []
-          rule_map = {'ip_protocol' => rule.ipProtocol, 'from_port' => rule.fromPort.to_i, 'to_port' => rule.toPort.to_i}
-          # Collect the group and ipRange rules
-          rule.groups.item.each do |rule_group|
-            rule_maps << rule_map.merge('source_security_group_name' => rule_group.groupName, 'source_security_group_owner_id' => rule_group.userId)
-          end if rule.groups
-          rule.ipRanges.item.each do |ip|
-            rule_maps << rule_map.merge('cidr_ip' => ip.cidrIp)
-          end if rule.ipRanges
-          # For each rule, if it exists, do nothing, otherwise remove it as its no longer defined locally
-          rule_maps.each do |rule_map|
-            if rules.delete(rule_map)
-              # rules match, don't need to do anything
-              # logger.debug "Rule in sync: #{rule_map.inspect}"
-            else
-              # rules don't match, remove them from ec2 and re-add below
-              answer = Capistrano::CLI.ui.ask("Rule '#{rule_map.inspect}' exists in ec2, but not locally, remove from ec2? [y/N]?: ")
-              rule = Rubber::Util::symbolize_keys(rule_map.merge(:group_name => item.groupName))
-              ec2.revoke_security_group_ingress(rule) if answer =~ /^y/
+          if rule.groups
+            rule.groups.item.each do |rule_group|
+              rule_map = {'source_security_group_name' => rule_group.groupName, 'source_security_group_owner_id' => rule_group.userId}
+              rule_map = Rubber::Util::stringify(rule_map)
+              rule_maps << rule_map unless rule_maps.include?(rule_map)
             end
+          else
+            rule_map = {'ip_protocol' => rule.ipProtocol, 'from_port' => rule.fromPort.to_i, 'to_port' => rule.toPort.to_i}
+            rule.ipRanges.item.each do |ip|
+              rule_map = rule_map.merge('cidr_ip' => ip.cidrIp)
+              rule_map = Rubber::Util::stringify(rule_map)
+              rule_maps << rule_map unless rule_maps.include?(rule_map)
+            end if rule.ipRanges
           end
         end if item.ipPermissions
+        
+        # For each rule, if it exists, do nothing, otherwise remove it as its no longer defined locally
+        rule_maps.each do |rule_map|
+          if rules.delete(rule_map)
+            # rules match, don't need to do anything
+            # logger.debug "Rule in sync: #{rule_map.inspect}"
+          else
+            # rules don't match, remove them from ec2 and re-add below
+            answer = Capistrano::CLI.ui.ask("Rule '#{rule_map.inspect}' exists in ec2, but not locally, remove from ec2? [y/N]?: ")
+            rule = Rubber::Util::symbolize_keys(rule_map.merge(:group_name => item.groupName))
+            ec2.revoke_security_group_ingress(rule) if answer =~ /^y/
+          end
+        end
+        
         rules.each do |rule|
           # create non-existing rules
           logger.debug "Missing rule, creating: #{rule.inspect}"
@@ -335,7 +353,7 @@ namespace :rubber do
         # when using auto groups, get prompted too much to delete when
         # switching between production/staging since the hosts aren't shared
         # between the two environments
-        unless env.auto_security_groups
+        if env.force_security_group_cleanup || ! env.auto_security_groups
           # delete group
           answer = Capistrano::CLI.ui.ask("Security group '#{item.groupName}' exists in ec2 but not locally, remove from ec2? [y/N]: ")
           ec2.delete_security_group(:group_name => item.groupName) if answer =~ /^y/
@@ -365,8 +383,15 @@ namespace :rubber do
   DESC
   required_task :setup_security_groups do
     env = rubber_cfg.environment.bind()
-    groups = env.ec2_security_groups
-    sync_security_groups(groups)
+    security_group_defns = env.ec2_security_groups
+    if env.auto_security_groups
+      hosts = rubber_cfg.instance.collect{|ic| ic.name }
+      roles = rubber_cfg.instance.all_roles
+      security_group_defns = inject_auto_security_groups(security_group_defns, hosts, roles)
+      sync_security_groups(security_group_defns)
+    else
+      sync_security_groups(security_group_defns)
+    end
   end
 
   desc <<-DESC
@@ -377,7 +402,7 @@ namespace :rubber do
     ec2 = EC2::Base.new(:access_key_id => env.aws_access_key, :secret_access_key => env.aws_secret_access_key)
     
     response = ec2.describe_security_groups()
-    puts response.xml
+    puts response.securityGroupInfo.item.pretty_inspect
   end
 
   desc <<-DESC
@@ -662,7 +687,7 @@ namespace :rubber do
     arch = case arch when /i\d86/ then "i386" else arch end
     sudo_script "create_bundle", <<-CMD
       export RUBYLIB=/usr/lib/site_ruby/
-      ec2-bundle-vol -d #{mnt_vol} -k #{ec2_pk_dest} -c #{ec2_cert_dest} -u #{aws_account} -p #{image_name} -r #{arch}
+      ec2-bundle-vol --batch -d #{mnt_vol} -k #{ec2_pk_dest} -c #{ec2_cert_dest} -u #{aws_account} -p #{image_name} -r #{arch}
     CMD
   end
 
@@ -671,7 +696,7 @@ namespace :rubber do
     
     sudo_script "register_bundle", <<-CMD
       export RUBYLIB=/usr/lib/site_ruby/
-      ec2-upload-bundle -b #{env.ec2_image_bucket} -m #{mnt_vol}/#{image_name}.manifest.xml -a #{env.aws_access_key} -s #{env.aws_secret_access_key}
+      ec2-upload-bundle --batch -b #{env.ec2_image_bucket} -m #{mnt_vol}/#{image_name}.manifest.xml -a #{env.aws_access_key} -s #{env.aws_secret_access_key}
     CMD
     
     ec2 = EC2::Base.new(:access_key_id => env.aws_access_key, :secret_access_key => env.aws_secret_access_key)
@@ -722,8 +747,18 @@ namespace :rubber do
     # Need to do this so we can work with staging instances without having to
     # checkin instance file between create and bootstrap, as well as during a deploy
     if fetch(:push_instance_config, false)
-      dest_instance_file = rubber_cfg.instance.file.sub(/^#{RAILS_ROOT}/, '')
-      put(File.read(rubber_cfg.instance.file), File.join(path, dest_instance_file))
+      push_files = [rubber_cfg.instance.file] + rubber_cfg.environment.config_files
+      push_files.each do |file|
+        dest_file = file.sub(/^#{RAILS_ROOT}\/?/, '')
+        put(File.read(file), File.join(path, dest_file))
+      end
+    end
+    
+    # if the user has defined a secret config file, then push it into RAILS_ROOT/config/rubber
+    secret = rubber_cfg.environment.config_secret
+    if secret && File.exist?(secret)
+      base = rubber_cfg.environment.config_root.sub(/^#{RAILS_ROOT}\/?/, '')
+      put(File.read(secret), File.join(path, base, File.basename(secret)))
     end
     
     sudo "sh -c 'cd #{path} && #{extra_env} rake rubber:config'"
@@ -1118,10 +1153,6 @@ namespace :rubber do
   # Automatically load and define capistrano roles from instance config
   def load_roles
     top.roles.clear
-    if ENV['FILTER']
-      filters = ENV['FILTER'].split(/\s*,\s*/)
-      logger.info "Applying filters to auto roles"
-    end
 
     # define empty roles for all known ones so tasks don't fail if a role
     # doesn't exist due to a filter
@@ -1131,15 +1162,13 @@ namespace :rubber do
     all_roles.each {|name| top.roles[name.to_sym] = []}
 
     # define capistrano host => role mapping for all instances
-    rubber_cfg.instance.each do |ic|
-      if ! filters || filters.include?(ic.name)
-        ic.roles.each do |role|
-          opts = Rubber::Util::symbolize_keys(role.options)
-          msg = "Auto role: #{role.name.to_sym} => #{ic.full_name}"
-          msg << ", #{opts.inspect}" if opts.inspect.size > 0
-          logger.info msg
-          top.role role.name.to_sym, ic.full_name, opts
-        end
+    rubber_cfg.instance.filtered.each do |ic|
+      ic.roles.each do |role|
+        opts = Rubber::Util::symbolize_keys(role.options)
+        msg = "Auto role: #{role.name.to_sym} => #{ic.full_name}"
+        msg << ", #{opts.inspect}" if opts.inspect.size > 0
+        logger.info msg
+        top.role role.name.to_sym, ic.full_name, opts
       end
     end
   end
